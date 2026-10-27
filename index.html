@@ -164,6 +164,15 @@ header p{margin:4px 0 0;font-size:.92rem;opacity:.92}
 .dialogue button{border-radius:999px;padding:8px 16px;font-weight:700;cursor:pointer;border:1px solid var(--ligne);background:var(--surface);color:var(--texte)}
 .dialogue button.ok{background:var(--rouge);border-color:var(--rouge);color:#fff}
 
+.haut-droite{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.verrou{border:1.5px solid rgba(255,255,255,.7);background:transparent;color:var(--sur-rouge);border-radius:999px;
+  padding:5px 12px;font-weight:700;font-size:.82rem;cursor:pointer}
+.verrou:hover{background:rgba(0,0,0,.15)}
+body.lecture .coin,body.lecture .suppr,body.lecture .ajouter{display:none}
+body.lecture .bulle,body.lecture .case,body.lecture .carte-match{cursor:default}
+body.lecture .carte-match{padding-right:10px}
+.message{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(20px + env(safe-area-inset-bottom,0px));z-index:40;
+  background:var(--texte);color:var(--fond);padding:10px 16px;border-radius:10px;font-size:.9rem;max-width:min(92vw,460px);text-align:center}
 @media (max-width:1100px){ .grille{grid-template-columns:repeat(3,minmax(0,1fr))} }
 @media (max-width:800px){
   .page{grid-template-columns:minmax(0,1fr)}
@@ -183,7 +192,7 @@ header p{margin:4px 0 0;font-size:.92rem;opacity:.92}
       <h1>Tournoi de pickleball</h1>
       <p>Double Trouble · disponibilités et matchs</p>
     </div>
-    <span class="sync local" id="sync">Connexion…</span>
+    <div class="haut-droite"><span class="sync local" id="sync">Connexion…</span><button class="verrou" id="btnVerrou" type="button">🔒 Modifier</button></div>
   </div>
 </header>
 
@@ -213,9 +222,8 @@ header p{margin:4px 0 0;font-size:.92rem;opacity:.92}
 
     <div class="bas">
       <div>
-        <p class="aide">Touche une plage pour passer de disponibles à pas disponibles. Pour déplacer un match, touche-le puis
+        <p class="aide">Pour modifier, touche 🔒 Modifier en haut et entre le NIP (une seule fois par appareil). Touche une plage pour passer de disponibles à pas disponibles. Pour déplacer un match, touche-le puis
         touche la nouvelle plage. En vue détaillée, ✎ ajoute une note et ✕ remet un match à planifier.</p>
-        <button class="lien" id="btnReinit">Revenir à la configuration de départ</button>
       </div>
       <aside class="equipes">
         <h2>Équipes</h2>
@@ -229,6 +237,8 @@ header p{margin:4px 0 0;font-size:.92rem;opacity:.92}
   <span id="bandeauTexte"></span>
   <button id="btnAnnulerPlacement">Annuler</button>
 </div>
+
+<div class="message" id="message" role="status" hidden></div>
 
 <div class="voile" id="voile" hidden>
   <div class="dialogue" role="dialog" aria-modal="true" aria-labelledby="dlgTitre">
@@ -258,7 +268,6 @@ header p{margin:4px 0 0;font-size:.92rem;opacity:.92}
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.2/dist/umd/supabase.js"></script>
 <script>
 /* ===================== CONFIGURATION ===================== */
 const NB_SEMAINES = 4, JOURS = 5, NB_TERRAINS = 12;
@@ -297,58 +306,103 @@ function lireLocal(){ try{ const d = JSON.parse(localStorage.getItem(CLE_LOCALE)
 function ecrireLocal(){ try{ localStorage.setItem(CLE_LOCALE, JSON.stringify(donnees)); }catch(e){} }
 let donnees = lireLocal() || depart();
 
-const SUPABASE_URL = "https://qqugqfmjppvcbbcblggd.supabase.co";
-const SUPABASE_CLE = "sb_publishable_vezUTlV5PSGFkl_1epJVng_lpwREUPF";
-const ID_LIGNE = "double-trouble";
-let sb = null, enLigne = false;
-let fileEcriture = Promise.resolve(), ecritureEnAttente = false, ecrituresEnCours = 0;
+const API = "https://script.google.com/macros/s/AKfycbw896x33YN6Wy6lmOTIfhKYAXjU3A0vXsDlg1kHffluWf5oICJYeFC0Mh0yMQembcPt/exec";
+const CLE_NIP = "pickleball-dt-nip";
+let nip = null; try{ nip = localStorage.getItem(CLE_NIP); }catch(e){}
+let modeEdition = !!nip;
+let versionServeur = 0;
+let minuterie = null, envoiEnCours = false, aRenvoyer = false;
+
 function majSync(texte, local){ const s = document.getElementById("sync"); s.textContent = texte; s.classList.toggle("local", !!local); }
+function majVerrou(){
+  document.body.classList.toggle("lecture", !modeEdition);
+  document.getElementById("btnVerrou").textContent = modeEdition ? "🔓 Verrouiller" : "🔒 Modifier";
+}
+let minuterieMessage = null;
+function message(texte){
+  const m = document.getElementById("message");
+  m.textContent = texte; m.hidden = false;
+  clearTimeout(minuterieMessage); minuterieMessage = setTimeout(() => { m.hidden = true; }, 5000);
+}
+
+async function appelApi(corps){
+  const r = await fetch(API, { method:"POST", headers:{ "Content-Type":"text/plain;charset=utf-8" }, body: JSON.stringify(corps) });
+  return r.json();
+}
 
 function sauver(){
   ecrireLocal();
-  if(!sb) return;
-  if(ecritureEnAttente) return;           // une écriture déjà prévue reprendra l'état le plus récent
-  ecritureEnAttente = true;
-  fileEcriture = fileEcriture.then(async () => {
-    ecritureEnAttente = false;
-    ecrituresEnCours++;
-    try{
-      const { error } = await sb.from("etat").update({ donnees: clone(donnees), maj: new Date().toISOString() }).eq("id", ID_LIGNE);
-      if(error) throw error;
-      majSync("Synchronisé");
-    }catch(e){ majSync("Hors ligne · sauvegarde locale", true); }
-    finally{ ecrituresEnCours--; }
-  });
+  if(!modeEdition) return;
+  aRenvoyer = true;
+  clearTimeout(minuterie);
+  minuterie = setTimeout(envoyer, 700);     // regroupe les clics rapides en un seul envoi
 }
 
-function appliquerDistant(d){
-  if(ecritureEnAttente || ecrituresEnCours > 0) return;   // ne pas écraser un changement local en cours d'envoi
-  if(d && d.modifs && Array.isArray(d.matchs)){ donnees = clone(d); ecrireLocal(); rendre(); }
+async function envoyer(){
+  minuterie = null;
+  if(envoiEnCours || !aRenvoyer || !modeEdition) return;
+  envoiEnCours = true; aRenvoyer = false;
+  majSync("Enregistrement…", true);
+  try{
+    const r = await appelApi({ action:"enregistrer", nip, donnees: clone(donnees), versionBase: versionServeur });
+    if(r.ok){ versionServeur = r.version; majSync("Synchronisé"); }
+    else if(r.erreur === "conflit"){
+      versionServeur = r.version;
+      if(r.donnees){ donnees = clone(r.donnees); ecrireLocal(); rendre(); }
+      aRenvoyer = false;
+      message("Quelqu'un d'autre venait de modifier. Ton dernier changement n'a pas été enregistré : refais-le.");
+      majSync("Synchronisé");
+    }
+    else if(r.erreur === "nip"){ oublierNip(); message("Le NIP n'est plus valide. Entre-le de nouveau pour modifier."); majSync("Lecture seule", true); }
+    else if(r.erreur === "bloque"){ aRenvoyer = true; message("Trop d'essais de NIP ratés. Réessaie dans 10 minutes."); majSync("Bloqué", true); }
+    else { message("Enregistrement refusé (" + (r.erreur || "inconnu") + ")."); majSync("Erreur", true); }
+  }catch(e){
+    aRenvoyer = true;                          // on réessaiera au prochain rafraîchissement
+    majSync("Hors ligne · non enregistré", true);
+  }finally{
+    envoiEnCours = false;
+    if(aRenvoyer && !minuterie && navigator.onLine !== false) minuterie = setTimeout(envoyer, 15000);
+  }
 }
 
 async function rafraichir(){
-  if(!sb) return;
+  if(minuterie || envoiEnCours || aRenvoyer){ if(aRenvoyer && !minuterie && !envoiEnCours) envoyer(); return; }
   try{
-    const { data, error } = await sb.from("etat").select("donnees").eq("id", ID_LIGNE).single();
-    if(error) throw error;
-    appliquerDistant(data.donnees);
-    majSync("Synchronisé");
-  }catch(e){ majSync("Hors ligne · sauvegarde locale", true); }
+    const r = await (await fetch(API)).json();
+    if(!r.ok) throw 0;
+    if(minuterie || envoiEnCours || aRenvoyer) return;          // un changement local est parti entre-temps
+    if(r.version !== versionServeur && r.donnees && Array.isArray(r.donnees.matchs)){
+      versionServeur = r.version; donnees = clone(r.donnees); ecrireLocal(); rendre();
+    }
+    majSync(modeEdition ? "Synchronisé" : "Synchronisé · lecture seule", !modeEdition);
+  }catch(e){ majSync("Hors ligne", true); }
 }
 
-async function brancherSynchro(){
-  if(!window.supabase || !window.supabase.createClient){ majSync("Sauvegarde sur cet appareil", true); return; }
-  sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_CLE, { auth:{ persistSession:false } });
-  await rafraichir();
+function oublierNip(){ nip = null; modeEdition = false; try{ localStorage.removeItem(CLE_NIP); }catch(e){} annulerSelection(); majVerrou(); rendre(); }
+
+async function deverrouiller(){
+  const saisi = await dialogue({ titre:"Entrer le NIP", texte:"Le NIP permet de modifier le tableau sur cet appareil. Il reste mémorisé ici.", champ:"password", ok:"Déverrouiller" });
+  if(saisi === null || !saisi.trim()) return;
   try{
-    sb.channel("etat-" + ID_LIGNE)
-      .on("postgres_changes", { event:"UPDATE", schema:"public", table:"etat", filter:"id=eq." + ID_LIGNE },
-          p => { if(p && p.new) appliquerDistant(p.new.donnees); })
-      .subscribe();
-  }catch(e){}
-  // Filet de sécurité : relecture au retour sur la page (cell qui sort de veille) et aux 30 s
+    const r = await appelApi({ action:"verifier", nip: saisi.trim() });
+    if(r.ok){
+      nip = saisi.trim(); modeEdition = true;
+      try{ localStorage.setItem(CLE_NIP, nip); }catch(e){}
+      majVerrou(); rendre(); message("Mode modification activé sur cet appareil.");
+      rafraichir();
+    } else if(r.erreur === "bloque") message("Trop d'essais ratés. Réessaie dans 10 minutes.");
+    else message("NIP incorrect.");
+  }catch(e){ message("Impossible de joindre le serveur. Vérifie ta connexion."); }
+}
+function exigerEdition(){ if(modeEdition) return true; deverrouiller(); return false; }
+
+function brancherSynchro(){
+  document.getElementById("btnVerrou").onclick = () => modeEdition ? oublierNip() : deverrouiller();
+  majVerrou();
+  rafraichir();
   document.addEventListener("visibilitychange", () => { if(document.visibilityState === "visible") rafraichir(); });
-  setInterval(() => { if(document.visibilityState === "visible") rafraichir(); }, 30000);
+  window.addEventListener("online", rafraichir);
+  setInterval(() => { if(document.visibilityState === "visible") rafraichir(); }, 20000);
 }
 
 /* ===================== DATES ===================== */
@@ -375,6 +429,7 @@ const matchParId = id => donnees.matchs.find(m => m.id === id);
 
 let selection = null;   // id du match en cours de placement (mode tactile)
 function choisir(id){
+  if(selection !== id && !exigerEdition()) return;
   selection = (selection === id) ? null : id;
   const m = selection && matchParId(selection);
   document.getElementById("bandeau").hidden = !m;
@@ -385,6 +440,7 @@ function choisir(id){
 function annulerSelection(){ if(selection) choisir(selection); }
 
 async function placer(id, cle, indexJour, code){
+  if(!exigerEdition()) return;
   const m = matchParId(id);
   if(!m) return;
   if(m.cle === cle){ annulerSelection(); return; }
@@ -399,6 +455,7 @@ async function placer(id, cle, indexJour, code){
   sauver(); rendre();
 }
 function deplanifier(id){
+  if(!exigerEdition()) return;
   const m = matchParId(id);
   if(!m || m.cle === null) return;
   m.cle = null; m.terrain = "";
@@ -406,6 +463,7 @@ function deplanifier(id){
   sauver(); rendre();
 }
 function cycler(cle, i, code){
+  if(!exigerEdition()) return;
   const a = etatBase(cle, i, code);
   donnees.modifs[cle] = { etat: CYCLE[(CYCLE.indexOf(a.etat)+1) % CYCLE.length], note: a.note };
   sauver(); rendre();
@@ -422,6 +480,9 @@ function dialogue({ titre, texte, champ, valeur="", ok="OK", seulOk=false }){
     document.getElementById("dlgTitre").textContent = titre;
     document.getElementById("dlgTexte").textContent = texte || "";
     inp.hidden = !champ; inp.value = valeur;
+    inp.type = champ === "password" ? "password" : "text";
+    inp.inputMode = champ === "password" ? "numeric" : "text";
+    inp.autocomplete = "off";
     document.getElementById("dlgOk").textContent = ok;
     document.getElementById("dlgAnnuler").hidden = seulOk;
     v.hidden = false;
@@ -437,7 +498,7 @@ function dialogue({ titre, texte, champ, valeur="", ok="OK", seulOk=false }){
 let idGlisse = null;
 function glissable(el, id){
   el.draggable = true;
-  el.addEventListener("dragstart", e => { idGlisse = id; e.dataTransfer.effectAllowed = "move"; try{ e.dataTransfer.setData("text/plain", id); }catch(_){} });
+  el.addEventListener("dragstart", e => { if(!modeEdition){ e.preventDefault(); return; } idGlisse = id; e.dataTransfer.effectAllowed = "move"; try{ e.dataTransfer.setData("text/plain", id); }catch(_){} });
   el.addEventListener("dragend", () => { idGlisse = null; document.querySelectorAll(".survol").forEach(x => x.classList.remove("survol")); });
 }
 function cible(el, surDepot){
@@ -466,6 +527,7 @@ function rendrePanneau(){
     c.addEventListener("keydown", e => { if((e.key === "Enter" || e.key === " ") && e.target === c){ e.preventDefault(); choisir(m.id); } });
     c.querySelector(".suppr").addEventListener("click", async e => {
       e.stopPropagation();
+      if(!exigerEdition()) return;
       const ok = await dialogue({ titre:"Supprimer ce match ?", texte:nomMatch(m), ok:"Supprimer" });
       if(!ok) return;
       donnees.matchs = donnees.matchs.filter(x => x.id !== m.id);
@@ -497,12 +559,14 @@ function selectTerrain(match){
   sel.add(new Option("Terrain",""));
   for(let t=1; t<=NB_TERRAINS; t++) sel.add(new Option(`Terrain #${t}`, String(t)));
   sel.value = match.terrain || "";
+  sel.disabled = !modeEdition;
   ["click","mousedown","touchstart"].forEach(ev => sel.addEventListener(ev, e => e.stopPropagation(), { passive:true }));
   sel.addEventListener("change", () => { match.terrain = sel.value; sauver(); rendre(); });
   return sel;
 }
 
 function rendre(){
+  document.body.classList.toggle("lecture", !modeEdition);
   document.getElementById("principal").classList.toggle("compact", vue === "compact");
   document.getElementById("vueCompacte").setAttribute("aria-pressed", vue === "compact");
   document.getElementById("vueDetail").setAttribute("aria-pressed", vue !== "compact");
@@ -572,6 +636,7 @@ function rendre(){
             b.addEventListener("click", () => toucherPlage(cle, i, p.code));
             b.querySelector(".coin").addEventListener("click", async e => {
               e.stopPropagation();
+              if(!exigerEdition()) return;
               const a = etatBase(cle, i, p.code);
               const note = await dialogue({ titre:"Note", texte:`${fmtJour.format(d)} à ${p.libelle}`, champ:true, valeur:a.note, ok:"Enregistrer" });
               if(note === null) return;
@@ -609,6 +674,7 @@ function rendreEquipes(){
   const effacer = () => { err.hidden = true; };
   selA.onchange = selB.onchange = effacer;
   document.getElementById("btnAjouterMatch").onclick = () => {
+    if(!exigerEdition()) return;
     selA.value = NOTRE_EQUIPE;
     selB.value = EQUIPES.find(([n]) => n !== NOTRE_EQUIPE)[0];
     effacer(); voile.hidden = false; selB.focus();
@@ -630,11 +696,6 @@ document.getElementById("btnAnnulerPlacement").onclick = annulerSelection;
 function changerVue(v){ vue = v; try{ localStorage.setItem(CLE_VUE, v); }catch(e){} rendre(); }
 document.getElementById("vueCompacte").onclick = () => changerVue("compact");
 document.getElementById("vueDetail").onclick = () => changerVue("detail");
-document.getElementById("btnReinit").onclick = async () => {
-  const ok = await dialogue({ titre:"Revenir au départ ?", texte:"Ça efface les notes, les changements de disponibilité et le placement des matchs, pour tout le monde.", ok:"Réinitialiser" });
-  if(!ok) return;
-  donnees = depart(); selection = null; sauver(); rendre();
-};
 document.addEventListener("keydown", e => { if(e.key === "Escape" && document.getElementById("voile").hidden) annulerSelection(); });
 
 rendreEquipes();
